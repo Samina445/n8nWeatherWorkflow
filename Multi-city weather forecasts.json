@@ -1,0 +1,517 @@
+{
+  "name": "Multi-city weather forecasts",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "function extractRaw(o) {\n  if (typeof o === 'string') return o;\n  const m = o.message || o.messages || o;\n  if (typeof m?.content === 'string') return m.content;\n  if (Array.isArray(m?.content)) {\n    const first = m.content[0];\n    if (typeof first?.text?.value === 'string') return first.text.value;\n    if (typeof first?.text === 'string') return first.text;\n  }\n  if (Array.isArray(m)) {\n    const c = m[0]?.content;\n    if (typeof c === 'string') return c;\n    if (Array.isArray(c)) {\n      const first = c[0];\n      if (typeof first?.text?.value === 'string') return first.text.value;\n      if (typeof first?.text === 'string') return first.text;\n    }\n  }\n  return JSON.stringify(o);\n}\nfunction tryParseJSON(s) {\n  if (!s || typeof s !== 'string') return null;\n  try { return JSON.parse(s); } catch {}\n  const start = s.indexOf('{');\n  const end = s.lastIndexOf('}');\n  if (start >= 0 && end > start) {\n    const candidate = s.slice(start, end + 1);\n    try { return JSON.parse(candidate); } catch {}\n  }\n  return null;\n}\n\nconst raw = extractRaw($json);\nconst parsed = tryParseJSON(raw);\n\nif (parsed && parsed.subject && parsed.html) {\n  return [{ subject: parsed.subject, html: parsed.html, ok: true }];\n} else {\n  return [{ ok: false, reason: 'bad_json', raw }];\n}\n"
+      },
+      "id": "e3dd67cd-ccf8-4a00-b564-f71e103dc2bd",
+      "name": "JS - Validate JSON from LLM",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2784,
+        512
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "sendTo": "mehboob.samina@gmail.com",
+        "subject": "={{ $('LLM - AI Weather Briefing Composer').item.json.message.content.subject }}",
+        "message": "={{ $('LLM - AI Weather Briefing Composer').item.json.message.content.html }}",
+        "options": {}
+      },
+      "id": "4d3dbe0f-e1e8-47a0-b61c-560b5e3b3152",
+      "name": "GMAIL - Send Weather Briefing",
+      "type": "n8n-nodes-base.gmail",
+      "position": [
+        2672,
+        848
+      ],
+      "webhookId": "9043b9cb-2579-49d5-8812-f39b84575dc7",
+      "typeVersion": 2.1,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "fcEppNVJmp1V5mBY",
+          "name": "Gmail account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pack all incoming items into one payload for the LLM.\nconst cities = items.map(i => ({\n  city: i.json.city,\n  country: i.json.country,\n  summaries: i.json.summaries\n}));\nreturn [{ cities }];\n"
+      },
+      "id": "f8bc5aa7-5496-4ede-9b3e-30b8c0fc82fa",
+      "name": "JS - Bundle Cities for LLM",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2288,
+        592
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// We need to get the asked city from Pick Lat/Lon node\n// Since we can't use $items() reliably, we'll store it differently\n\n// The OpenWeatherMap response has city.name which is the API's name\n// But we need the original asked city name\n// Check if we have it in the input, otherwise fall back to API name\nconst apiCityName = $json.city?.name || 'City';\nconst apiCountry = $json.city?.country || '';\nconst tzOffset = $json.city?.timezone || 0; // seconds\nconst data = $json.list || [];\nconst units = 'metric';\n\n// Use the API city name for now - we'll fix this in the next step\nconst city = apiCityName;\nconst country = apiCountry;\n\nfunction toLocalDateStr(dt) {\n  // dt is unix seconds; shift by city timezone\n  const d = new Date((dt + tzOffset) * 1000);\n  return d.toISOString().slice(0,10); // YYYY-MM-DD\n}\n\n// Group by day\nconst days = {};\nfor (const p of data) {\n  const day = toLocalDateStr(p.dt);\n  if (!days[day]) days[day] = { points: [] };\n  days[day].points.push(p);\n}\n\n// Aggregate per day\nconst daySummaries = Object.entries(days).map(([date, obj]) => {\n  const pts = obj.points;\n\n  const temps = pts.map(p => p.main.temp);\n  const min = Math.min(...temps);\n  const max = Math.max(...temps);\n\n  // wind\n  const windMax = Math.max(...pts.map(p => (p.wind?.gust ?? p.wind?.speed ?? 0)));\n\n  // rain total (mm)\n  const rain = pts.reduce((acc, p) => acc + (p.rain?.['3h'] || 0), 0);\n\n  // pop average (precip probability 0..1)\n  const popAvg = pts.reduce((a,p)=>a+(p.pop||0),0) / (pts.length || 1);\n\n  // humidity average\n  const humAvg = pts.reduce((a,p)=>a+(p.main?.humidity||0),0) / (pts.length || 1);\n\n  // dominant condition by frequency\n  const counts = {};\n  for (const p of pts) {\n    const desc = (p.weather?.[0]?.main || 'Other');\n    counts[desc] = (counts[desc] || 0) + 1;\n  }\n  const dominant = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0]?.[0] || 'Other';\n\n  return {\n    date,\n    min_temp: Number(min.toFixed(1)),\n    max_temp: Number(max.toFixed(1)),\n    dominant_condition: dominant,\n    rain_mm: Number(rain.toFixed(1)),\n    precip_prob_avg: Number((popAvg*100).toFixed(0)),\n    wind_max: Number(windMax.toFixed(1)),\n    humidity_avg: Number(humAvg.toFixed(0)),\n    unit_temp: units === 'metric' ? '°C' : '°F',\n    unit_wind: units === 'metric' ? 'm/s' : 'mph'\n  };\n}).sort((a,b)=>a.date.localeCompare(b.date));\n\n// keep only next 5 days\nconst next5 = daySummaries.slice(0,5);\n\nreturn {\n  city,\n  country,\n  timezone_offset_seconds: tzOffset,\n  summaries: next5\n};"
+      },
+      "id": "20c008e1-60ce-4918-80fd-eec86a12d6ca",
+      "name": "JS - Build Daily Summaries (5 days)",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2176,
+        784
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "operation": "5DayForecast",
+        "cityName": "={{ $json.asked_city }}"
+      },
+      "id": "e4a5cdcb-5130-442b-9048-b3f23f04c1a1",
+      "name": "OpenWeatherMap (OWM) - 5 Day Forecast (by City)",
+      "type": "n8n-nodes-base.openWeatherMap",
+      "position": [
+        1984,
+        576
+      ],
+      "executeOnce": false,
+      "typeVersion": 1,
+      "credentials": {
+        "openWeatherMapApi": {
+          "id": "yYFxbSmb87zY60Mu",
+          "name": "OpenWeatherMap account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const asked = $json.city || null;\nconst location = $json.body?.[0] || $json.body;\n\nif (!location || !location.lat || !location.lon) {\n  throw new Error('No valid geocoding results for: ' + asked);\n}\n\nreturn {\n  asked_city: asked,\n  city_from_api: location.name || asked,\n  country: location.country || null,\n  lat: location.lat,\n  lon: location.lon\n};"
+      },
+      "id": "1f2bd245-672c-408d-8cc1-6094761ca25d",
+      "name": "JS - Pick Lat/Lon",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1600,
+        784
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "2c7d6017-02ca-4e76-ab6e-000707eea2ab",
+              "name": "asked_city",
+              "type": "string",
+              "value": "={{ $json.asked_city }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "91bec928-a18c-400c-be47-f157fb765445",
+      "name": "SET - Carry Asked City to Forecast",
+      "type": "n8n-nodes-base.set",
+      "position": [
+        1792,
+        784
+      ],
+      "typeVersion": 3.4
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {
+          "includeUnpaired": false
+        }
+      },
+      "id": "352ed7b2-0fa8-4817-8e97-7d44f2b61532",
+      "name": "MERGE - Pair Cities",
+      "type": "n8n-nodes-base.merge",
+      "position": [
+        1424,
+        784
+      ],
+      "typeVersion": 3.2
+    },
+    {
+      "parameters": {
+        "url": "https://api.openweathermap.org/geo/1.0/direct",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "=={{ encodeURIComponent($json.city) }}"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            },
+            {
+              "name": "appid",
+              "value": "1e0d4c7839298e9a03f1685c4bba096e"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e875f9e7-76a7-4e0c-8bc6-b2ea6b3315e3",
+      "name": "HTTP - OWM Geocoding",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        1184,
+        528
+      ],
+      "typeVersion": 4.2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect only city names from the form payload\n// Filter out metadata fields like submittedAt and formMode\nconst cities = [];\n\nfor (const [key, value] of Object.entries($json)) {\n  // Exclude known metadata fields\n  if (key === 'submittedAt' || key === 'formMode') {\n    continue;\n  }\n  \n  // Include all other string values that are not empty\n  if (typeof value === 'string' && value.trim()) {\n    cities.push(value.trim());\n  }\n}\n\n// Limit to 3 cities and create one item per city\nreturn cities.slice(0, 3).map(c => ({ city: c }));"
+      },
+      "id": "902838c3-7e2f-451b-b4c2-8760c055ced7",
+      "name": "JS - Normalize City Inputs",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        976,
+        800
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "formTitle": "Weather Predictor",
+        "formDescription": "It provides the weather prediction of 3 cities and provide general tips and precuations",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Enter City Name 1",
+              "placeholder": "eg: Hyderabad",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Enter City Name 2",
+              "placeholder": "eg: Bangalore",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Enter City Name 3",
+              "placeholder": "Chennai",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fa3e4536-21b3-4895-83a6-b6d96184353f",
+      "name": "TRIGGER - Input City Names",
+      "type": "n8n-nodes-base.formTrigger",
+      "position": [
+        800,
+        800
+      ],
+      "webhookId": "6f37479d-22bd-40ad-8b1b-a3f3736c467b",
+      "typeVersion": 2.3
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4o-mini",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an expert meteorologist creating professional weather briefings. Return STRICT JSON with keys: subject, html. Use clear, actionable language. No conversational text outside the JSON.\n\n",
+              "role": "system"
+            },
+            {
+              "content": "=You are an expert meteorologist creating professional weather briefings. Return STRICT JSON with keys: subject, html. Use clear, actionable language. No conversational text outside the JSON.\n```\n\n## **Revised User Prompt:**\n```\nCreate a professional 5-day weather forecast email for EACH city in this JSON:\n{{ JSON.stringify($json.cities) }}\n\nREQUIREMENTS:\n\n📋 Structure:\n- Start with a friendly greeting and brief intro\n- For each city, use H2 with \"🌤️ City — Country\"\n- HTML table with these columns: Date | Temp Range | Conditions | Rain(mm) | Precip(%) | Wind(m/s) | General Tips | Precautions\n- Add a concluding paragraph with travel/planning tips across all cities\n\n🎨 Styling (use inline CSS):\n- Header row: background #4A90E2 (blue), white text, bold, font-size: 14px\n- Borders: 1px solid #DEE2E6 on all cells\n- Padding: 10px in cells\n- Font: Arial, sans-serif, font-size: 13px\n- Center-align all table content\n- Table width: 100%, border-collapse: collapse\n\n🌈 CONDITION-BASED ROW COLORS (apply to entire row based on dominant_condition):\n- \"Clear\": background-color: #FFFACD (light yellow)\n- \"Clouds\": background-color: #ADD8E6 (light blue)\n- \"Rain\": background-color: #FFB6C6 (light red/pink)\n- Extremely sunny (max_temp ≥ 35°C AND condition is \"Clear\"): background-color: #FFBF00 (amber)\n- Default (other conditions): background-color: #FFFFFF (white)\n\n📊 Content Guidelines:\n- Date: Format as \"YYYY-MM-DD (Day)\" - e.g., \"2025-10-19 (Sun)\"\n- Temp Range: Show as \"Min°C / Max°C\" (e.g., \"24° / 32°\")\n- Conditions: Add weather emoji + condition name:\n  - Clear: ☀️ Clear\n  - Clouds: ☁️ Clouds\n  - Rain: 🌧️ Rain\n  - Thunderstorm: ⛈️ Thunderstorm\n- Rain: Show mm value\n- Precip%: Show percentage value\n- Wind: Show m/s value\n- General Tips: Brief everyday advice (e.g., \"Stay hydrated\", \"Dress lightly\")\n- Precautions: Specific safety warnings (detailed below)\n\n⚠️ PRECAUTIONS Column Content (show relevant warnings only, or \"None\" if weather is safe):\n- Heavy rain (rain_mm ≥ 10 OR precip_prob_avg ≥ 70): \"⚠️ Heavy rain expected. Carry umbrella, avoid travel if possible. Expect waterlogging.\"\n- Moderate rain (rain_mm ≥ 5 AND < 10 OR precip_prob_avg ≥ 50 AND < 70): \"☔ Rain likely. Carry rain gear, drive carefully.\"\n- Extreme heat (max_temp ≥ 35°C): \"🌡️ HEAT ALERT: Stay indoors during peak hours (12-4 PM). Drink 3+ liters water. Risk of heat stroke.\"\n- High heat (max_temp ≥ 32°C AND < 35°C): \"☀️ Very hot. Limit outdoor activities. Use sunscreen SPF 50+.\"\n- High wind (wind_max ≥ 10 m/s): \"💨 Strong winds expected. Secure loose objects. Avoid outdoor hoardings.\"\n- Thunderstorms (if \"Thunderstorm\" in conditions): \"⛈️ STORM WARNING: Stay indoors. Unplug electronics. Avoid water bodies.\"\n- Multiple conditions: Combine warnings separated by \" | \"\n- Safe weather: \"None\" or \"✅ Safe weather conditions\"\n\n💡 GENERAL TIPS Column Content (positive, practical daily advice):\n- Clear & pleasant (max < 32°C): \"Great for outdoor activities\"\n- Clear & hot (max ≥ 32°C): \"Stay hydrated, use sun protection\"\n- Clouds: \"Comfortable weather, good for sightseeing\"\n- Light rain: \"Keep umbrella handy\"\n- Heavy rain: \"Plan indoor activities\"\n- Windy: \"Secure loose items\"\n\n📝 Email Subject:\nCreate an engaging subject that highlights the most significant weather event:\n- If any day has rain_mm ≥ 10: \"⚠️ Heavy Rain Alert: [City Names] | 5-Day Forecast\"\n- If any day has max_temp ≥ 35°C: \"🌡️ Heat Wave Alert: [City Names] | 5-Day Forecast\"\n- If all days are clear: \"☀️ Sunny Week Ahead: [City Names] | 5-Day Forecast\"\n- Otherwise: \"5-Day Weather Forecast: [City Names]\"\n\n🎯 Conclusion Paragraph:\nInclude:\n- Overall weather pattern across all cities\n- Best days for outdoor activities/travel\n- Most important safety advisory if any extreme weather\n- Friendly closing line\n\nCRITICAL: Apply the condition-based background color to the ENTIRE ROW (all cells in that row), not just the Conditions column.\n\nReturn ONLY valid JSON:\n{\"subject\":\"...\",\"html\":\"...\"}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {}
+      },
+      "id": "e1e86ba5-c928-4b10-88de-0838ffa665e0",
+      "name": "LLM - AI Weather Briefing Composer",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "position": [
+        2480,
+        512
+      ],
+      "typeVersion": 1.8,
+      "credentials": {
+        "openAiApi": {
+          "id": "DuHzISkkCrnJNyTY",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Geocoding (OWM)\n### Resolve each city to lat/lon using OpenWeather Geocoding API.",
+        "height": 656,
+        "width": 208,
+        "color": 4
+      },
+      "id": "6e953b03-7477-4289-90b2-4e3930ff3d9c",
+      "name": "Sticky Note1",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1136,
+        336
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## Pairing Cities ↔ Coordinates\n### Align normalized city with its geocode (by position) and select asked_city, country, lat, lon.",
+        "height": 400,
+        "width": 560,
+        "color": 6
+      },
+      "id": "1164ead0-9576-4e4b-9652-75bc0feb21e3",
+      "name": "Sticky Note2",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1360,
+        592
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## Forecast Retrieval\n### Pull 5-day forecast per city by coordinates.",
+        "height": 640,
+        "width": 208,
+        "color": 3
+      },
+      "id": "38f2dd11-6505-495d-9fdf-6b2705340bb6",
+      "name": "Sticky Note3",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1936,
+        352
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## LLM AI Weather Briefing\n### Ask LLM to produce subject + HTML for an email; validate/extract the result.",
+        "height": 352,
+        "width": 576,
+        "color": 2
+      },
+      "id": "66c98d7f-5646-41f8-a477-b4603894c178",
+      "name": "Sticky Note4",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2416,
+        352
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## Summarization & Packaging\n### Convert raw OWM output into per-day tables & guidance; bundle all cities into one payload.",
+        "height": 640,
+        "color": 4
+      },
+      "id": "f755b427-da5d-4f15-bbbd-14e2ecae956d",
+      "name": "Sticky Note5",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2160,
+        352
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## Delivery \n### Send the formatted briefing to the recipient(s).",
+        "height": 288,
+        "width": 576,
+        "color": 6
+      },
+      "id": "6496c5bc-5354-4eff-a90c-79bcbf9911ce",
+      "name": "Sticky Note6",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2416,
+        720
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## Input & Normalization\n### Collect 3 city names from the form and normalize (trim, title-case, dedupe).",
+        "height": 384,
+        "width": 352,
+        "color": 5
+      },
+      "id": "ea685c79-3a1b-42f0-8f00-f1b8b948cbed",
+      "name": "Sticky Note7",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        768,
+        608
+      ],
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "JS - Pick Lat/Lon": {
+      "main": [
+        [
+          {
+            "node": "SET - Carry Asked City to Forecast",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MERGE - Pair Cities": {
+      "main": [
+        [
+          {
+            "node": "JS - Pick Lat/Lon",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP - OWM Geocoding": {
+      "main": [
+        [
+          {
+            "node": "MERGE - Pair Cities",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JS - Bundle Cities for LLM": {
+      "main": [
+        [
+          {
+            "node": "LLM - AI Weather Briefing Composer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JS - Normalize City Inputs": {
+      "main": [
+        [
+          {
+            "node": "HTTP - OWM Geocoding",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "MERGE - Pair Cities",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "TRIGGER - Input City Names": {
+      "main": [
+        [
+          {
+            "node": "JS - Normalize City Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JS - Validate JSON from LLM": {
+      "main": [
+        [
+          {
+            "node": "GMAIL - Send Weather Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM - AI Weather Briefing Composer": {
+      "main": [
+        [
+          {
+            "node": "JS - Validate JSON from LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SET - Carry Asked City to Forecast": {
+      "main": [
+        [
+          {
+            "node": "OpenWeatherMap (OWM) - 5 Day Forecast (by City)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JS - Build Daily Summaries (5 days)": {
+      "main": [
+        [
+          {
+            "node": "JS - Bundle Cities for LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenWeatherMap (OWM) - 5 Day Forecast (by City)": {
+      "main": [
+        [
+          {
+            "node": "JS - Build Daily Summaries (5 days)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "76a5510d-35c2-498c-b0fc-d1e0bc7ddab9",
+  "meta": {
+    "instanceId": "ac3a17e67719fe92e230f69d2f08bbc7677a4b65b76197be157933967661e2a2"
+  },
+  "id": "xdBBX9kbIqRLWYPyX3mW_",
+  "tags": []
+}
